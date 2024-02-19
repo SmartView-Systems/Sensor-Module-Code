@@ -20,6 +20,28 @@ int state = 0;
 #define S2 2 // Has an ID and is sending data
 #define S3 3 // Has an ID and is sending data
 
+#define SEC 1000
+#define MIN 60000
+#define HOUR 3600000
+
+// LEDS
+#define NOWIFI 5
+#define YESWIFI 2 // This is for onboard led
+#define SENDING_DATA 2
+
+// Air Start
+#include <MQUnifiedsensor.h>
+//Definitions
+#define placa "ESP32"
+#define Voltage_Resolution 5
+#define pin 32
+// #define type "MQ-135" //MQ135
+#define ADC_Bit_Resolution 12 // For arduino UNO/MEGA/NANO
+#define RatioMQ135CleanAir 3.6//RS / R0 = 3.6 ppm  
+
+MQUnifiedsensor MQ135(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, "MQ-135");
+// Air End
+
 // Tunable Paramaters
 int RESET = 0; // pull high if you want to use
 int READ = 0; // pull high if you want to use
@@ -29,18 +51,11 @@ int deviceID = 0;
 int inProcess = 0;
 volatile float periord = 100; // default
 
+const int numDataPointsToCollect = 9;
+int dataToCollect[numDataPointsToCollect];
+
+
 bool periordChanged = false;
-
-#define SEC 1000
-#define MIN 60000
-#define HOUR 3600000
-
-// Buttons Pins
-#define NOWIFI 5
-#define YESWIFI 18
-#define SENDING_DATA 19
-#define BUTTON_PIN 22 // Example pin for the button (change accordingly)
-// Button Information End
 
 // IP and Mac Start
 char formattedIP[16]; // IPv4 addresses can have up to 15 characters (including dots) plus the null terminator
@@ -58,8 +73,7 @@ void buttonISR();
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
-const char *ssid = "MySpectrumWiFi5B-2G";
-const char *password = "urbanfamous507";
+const char* ssid = "BU Guest (unencrypted)";
 
 
 // MQTT Broker
@@ -106,10 +120,97 @@ PubSubClient client(espClient);
 
 
 ////////////////////////////////////////
+//               Setup                //
+////////////////////////////////////////
+void setup() {
+  // Serial Start
+  Serial.begin(115200);
+  Serial.println("Starting now");
+  delay(1000);
+  WiFi.mode(WIFI_STA); //Optional
+  // Serial End
+
+  // Sensor Setup TESTING WITHOUT AIR SENSOR
+  // dht.begin();
+
+  airInit();
+  delay(100);
+
+  // Wifi Setup Start
+  Serial.println("Starting Wifi Setup");
+  setupWifiandMQTT();
+  // Wifi Setup End
+
+  // Free RTOS Tasks Start
+  xTaskCreate(SampleSensor, "SampleSensor", 10000, NULL, 1, NULL);         
+  xTaskCreate(StateMachine, "StateMachine",10000, NULL, 2, NULL); 
+
+  // Free RTOS Tasks END
+
+  delay(1000);
+  // Get Time Start
+  timeClient.begin();
+  timeClient.setTimeOffset(0);
+
+  char epochTimeString[20];
+  getCurrentEpochTimeString(epochTimeString);
+  Serial.print("The current time is: ");
+  Serial.println(epochTimeString);
+
+
+  // Get Time Stop
+
+  // LED Indicators 
+  pinMode(NOWIFI, OUTPUT);
+  pinMode(YESWIFI, OUTPUT);
+  pinMode(SENDING_DATA, OUTPUT);
+
+  digitalWrite(NOWIFI, LOW);
+  digitalWrite(YESWIFI, LOW);
+  digitalWrite(SENDING_DATA, LOW);
+
+  delay(1000);
+  while(deviceID == 0){
+    SetupTask();
+    delay(10000); //Delay for 10 seconds
+  }
+}
+
+void loop() {
+    if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  delay(100);
+}
+
+////////////////////////////////////////
+//   Air Sensor Connection Functions  //
+////////////////////////////////////////
+void airInit(){
+  MQ135.setRegressionMethod(1); //_PPM =  a*ratio^b
+  MQ135.init(); 
+
+  Serial.print("Calibrating please wait.");
+  float calcR0 = 0;
+  for(int i = 1; i<=10; i ++)
+  {
+    MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+    calcR0 += MQ135.calibrate(RatioMQ135CleanAir);
+    Serial.print(".");
+  }
+  MQ135.setR0(calcR0/10);
+  Serial.println("  done!.");
+  
+  if(isinf(calcR0)) {Serial.println("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); while(1);}
+  if(calcR0 == 0){Serial.println("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); while(1);}
+}
+
+
+
+////////////////////////////////////////
 // WIFI and MQTT Connection Functions //
 ////////////////////////////////////////
-
-// Not called as of dec 18th
 void subscribeToTopic(char* topic) {
   client.subscribe(topic);
   Serial.print("Subscribed to topic: ");
@@ -136,7 +237,7 @@ void setupWifiandMQTT() {
     // Set software serial baud to 115200;
     Serial.begin(115200);
     // connecting to a WiFi network
-    WiFi.begin(ssid, password);
+    WiFi.begin(ssid);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.println("Connecting to WiFi..");
@@ -151,9 +252,9 @@ void setupWifiandMQTT() {
     client.setCallback(callback);
 
     while (!client.connected()) {
-        String client_id = "toChangeSoon";
+        String client_id = "ID";
         client_id += String(WiFi.macAddress());
-        Serial.printf("The client %s connects to the public mqtt broker\n", client_id.c_str());
+        Serial.printf("The client %s connected to broker\n", client_id.c_str());
         if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
             Serial.println("Labsensors MQTT Broker Connected");
         } else {
@@ -217,9 +318,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // Helper Functions //
 //////////////////////
 void getCurrentEpochTimeString(char* result) {
-  timeClient.update();
+  
+  timeClient.forceUpdate();
+  delay(100);
   unsigned long epochTime = timeClient.getEpochTime();
-
+  Serial.println(epochTime);
+  
   // Convert unsigned long to String
   String epochTimeString = String(epochTime);
 
@@ -239,9 +343,12 @@ int CalcPeriord(int frequency,char* units) {
   return localPeriord;
 }
 
-void createDataString(char returnString[], int localDeviceID,char epochTimeString[], float temperature, float humidity){
+// need to change soon
+void createDataString(char returnString[], int localDeviceID, char epochTimeString[], float dataToSend[]){
   // Convert deviceID to string using casting
   char deviceIDStr[10];
+  char holdString[10];
+
   itoa(localDeviceID, deviceIDStr, 10);
 
   strcpy(returnString, deviceIDStr);
@@ -251,16 +358,22 @@ void createDataString(char returnString[], int localDeviceID,char epochTimeStrin
   strcat(returnString, " ");
     
   // Convert temperature to string using dtostrf
-  char tempStr[10];
-  dtostrf(temperature, 5, 2, tempStr); // 5 is minimum width, 2 is precision
-  strcat(returnString, tempStr);
-  strcat(returnString, " ");
+  for (int i = 0; i < 8; i++)
+  {
+    strcat(returnString, "X");
+    char str[10];
+    sprintf(str, "%d", i);
+    strcat(returnString,str);  // Convert integer to string
+    strcat(returnString, ":");
 
-  // Convert humidity to string using dtostrf
-  char humStr[10];
-  dtostrf(humidity, 5, 2, humStr); // 5 is minimum width, 2 is precision
+    // Convert dataToSend[i] to string with dynamic width
+    char tempString[10];
+    int width = snprintf(tempString, sizeof(tempString), "%.2f", dataToSend[i]);
+    dtostrf(dataToSend[i], width, 2, holdString);
 
-  strcat(returnString, humStr);
+    strcat(returnString, holdString);
+    strcat(returnString, " ");
+  }
 
   Serial.print("MQTT String to be sent: ");
   Serial.println(returnString);
@@ -281,60 +394,6 @@ void sendMQTT(char* topic, char* message) {
   }
 }
 
-void setup() {
-  // Serial Start
-  Serial.begin(115200);
-  Serial.println("This has started");
-  // Serial End
-
-  // Sensor Setup
-  dht.begin();
-
-  // Wifi Setup Start
-  Serial.println("Starting Wifi Setup");
-  setupWifiandMQTT();
-  // Wifi Setup End
-
-  // Free RTOS Tasks Start
-  xTaskCreate(SampleSensor, "SampleSensor", 10000, NULL, 1, NULL);         
-  xTaskCreate(StateMachine, "StateMachine",10000, NULL, 2, NULL); 
-
-  // Free RTOS Tasks END
-
-  // Button Interupt Code Start
-  xSemaphore = xSemaphoreCreateBinary();
-  if (xSemaphore == NULL) {
-    Serial.println("Semaphore creation failed!");
-    while (1);
-  }
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
-  xTaskCreate(buttonTask, "Button Task", 10000, NULL, 1, NULL);
-  // Button Interupt Code END
-
-  // Get Time Start
-  timeClient.begin();
-  timeClient.setTimeOffset(0);
-  // Get Time Stop
-
-  // LED Indicators 
-  pinMode(NOWIFI, OUTPUT);
-  pinMode(YESWIFI, OUTPUT);
-  pinMode(SENDING_DATA, OUTPUT);
-
-  digitalWrite(NOWIFI, LOW);
-  digitalWrite(YESWIFI, LOW);
-  digitalWrite(SENDING_DATA, LOW);
-}
-
-void loop() {
-    if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-  delay(100);
-}
-
-
 // This is a helper function for parseCallback. This will parse the topic edit the incoming lab and topic action
 void parseTopic(char * incomingLab, char * topicAction, char* topic){
 
@@ -345,8 +404,11 @@ void parseTopic(char * incomingLab, char * topicAction, char* topic){
     strncpy(topicAction, separator, 15);
 }
 
+
+/////////////////////////////
+//     Parsing Function    //
+/////////////////////////////
 void parseCallback(char* topic, byte* payload){
-  Serial.println("This is a work in progress");
   char incomingLab[25] = "";
   char topicAction[25] = "";
 
@@ -357,13 +419,21 @@ void parseCallback(char* topic, byte* payload){
   Serial.print("Incoming topic Action: ");
   Serial.println(topicAction);
 
-  if(strcmp(incomingLab, labName) == 1){
-    Serial.println("ERROR, this is the incorrect Lab");
-  }
+  // Check to see if this is the correct Lab
+  if(strcmp(incomingLab, labName) == 1){ Serial.println("ERROR, this is the incorrect Lab"); }
   else{
     Serial.println("This is the correct lab, we shall proceed");
 
+
+
+    // 1) Incoming Inilization Message
+    // nialab/INIT/IN: 0C:DC:7E:CB:6C:D0 2 10 Minute 11111111
     if(strcmp(topicAction, "/INIT/IN") == 0){
+      if(false){ // True for Debug
+        Serial.println("Incoming /INIT/IN message");
+        return;
+      }
+
       Serial.println("Setup Detected");
       char* recievedMacAddress;
       char* recievedDeviceID;
@@ -377,20 +447,43 @@ void parseCallback(char* topic, byte* payload){
       Serial.println(recievedMacAddress);
 
       if (strcmp(recievedMacAddress, formattedMac) == 0){
+
         Serial.println("Formatting New Parameters");
 
+        // Update New Device ID (global)
         recievedDeviceID = strtok(NULL, " ");
         deviceID = atoi(recievedDeviceID);
 
+        // Update New Frequency (global)
         recievedFrequency = strtok(NULL, " ");
         frequency = atoi(recievedFrequency);
       
+        // Set New Units (local)
         units = strtok(NULL, " ");
-
         periord = CalcPeriord(frequency, units);
 
-        Serial.print("Finished Formatting Parameters, the periord is: ");
+
+        // Reset dataToCollect
+        for (int i = 0; i < numDataPointsToCollect; i++) {
+          dataToCollect[i] = 0;
+        }
+        char *token = strtok(NULL, " ");; // Define token variable
+        while (token != NULL) {
+          dataToCollect[atoi(token + 1)] = 1;
+          token = strtok(NULL, " "); // Move to the next token
+        } 
+
+
+        Serial.print("Finished Formatting Parameters:");
+        Serial.print("The periord is: ");
         Serial.println(periord);
+
+        Serial.print("The dataToCollect is: ");
+        for (int i = 0; i < numDataPointsToCollect; i++) {
+          Serial.print(dataToCollect[i]);
+          Serial.print(" ");
+        }
+        
 
         // Change State Parameters
         state = S3;
@@ -398,29 +491,64 @@ void parseCallback(char* topic, byte* payload){
       else{Serial.println("Incorret Device");}
     }
 
+
+
+
+
+    // 2) Infoming Configuration Change
+    // nialab/CONFIG 1 8 Hour 11110000
     if(strcmp(topicAction, "/CONFIG") == 0){
+      if(false){ // True for Debug
+        Serial.println("Incoming /CONFIG message");
+        return;
+      }
       int localDeviceID = atoi(strtok((char*)payload, " "));
 
       // If this is the correct device, configure the data
       if(localDeviceID == deviceID){
         char* frequency = strtok(NULL, " ");
         char* units = strtok(NULL, " ");
+        
+        // Reset dataToCollect
+        for (int i = 0; i < numDataPointsToCollect; i++) {
+          dataToCollect[i] = 0;
+        }
+        char *token = strtok(NULL, " ");; // Define token variable
+        while (token != NULL) {
+          dataToCollect[atoi(token + 1)] = 1;
+          token = strtok(NULL, " "); // Move to the next token
+        } 
 
+        // Update the Periord
         periordChanged = true;
-
         Serial.print("Periord has been changed from: ");
         Serial.print(periord);
-
         periord = CalcPeriord(atof(frequency), (units));
-
         vTaskDelay(30 / portTICK_PERIOD_MS); // Delay for 30ms
-        
         Serial.print(" -> ");
         Serial.println(periord);
+
+        Serial.print("The dataToCollect is: ");
+        for (int i = 0; i < numDataPointsToCollect; i++) {
+          Serial.print(dataToCollect[i]);
+          Serial.print(" ");
+        }
+
       }else{Serial.println("Wrong Device");}
     }
     
+
+
+
+
+    // 3) Incoming Status Check
+    // nialab/STATUS/OUT: STATUS
     if(strcmp(topicAction, "/STATUS/OUT") == 0){
+      if(false){ // True for Debug
+        Serial.println("Incoming /STATUS/OUT message");
+        return;
+      }
+
       char stringDeviceID[10];  // Adjust the size based on the expected length of the integer
       itoa(deviceID, stringDeviceID, 10);
 
@@ -442,18 +570,6 @@ void parseCallback(char* topic, byte* payload){
       sendMQTT(returnTopic, returnString);
     }
   }
-
-
-
-
-  // check to see if the lab is the correct lab
-  // check to see the type of topic
-
-  // if it is init in
-
-  // if it is config
-
-  // if it is status out
 }
 
 
@@ -495,48 +611,127 @@ void StateMachine(void *pvParameters) {
     }
     Serial.print("The State is:");
     Serial.println(state);
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // Delay for 1000ms
+    vTaskDelay(3000 / portTICK_PERIOD_MS); // Delay for 3 seconds
   }
 }
 
 // Task 2 function
+  // 0	DH11	Temperature
+  // 1	DH11	Humidity
+  // 2	Air Sensor	CO
+  // 3	Air Sensor	Alcohol
+  // 4	Air Sensor	CO2
+  // 5	Air Sensor	Toluene
+  // 6	Air Sensor	NH4
+  // 7	Air Sensor	Acetone
+  // 8 ADD LIGHT SOON
 void SampleSensor(void *pvParameters) {
   for (;;) {
     if(state == S3){
-      float humidity = dht.readHumidity();
-      float temperature = dht.readTemperature();
+      float dataToSend[8];
+      // Temperature
+      if(dataToCollect[0]){
+        MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
 
-      if (isnan(humidity) || isnan(temperature)) {
-        Serial.println("Failed to read from DHT sensor!");
-        return;
+        dataToSend[0] = dht.readTemperature();
+      }else{
+        dataToSend[0] = 0;
       }
-      
+
+      // Humidity
+      if(dataToCollect[1] ){
+        MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+
+        dataToSend[1] = dht.readHumidity();
+      }else{
+        dataToSend[1] = 0;
+      }
+
+      // CO
+      if(dataToCollect[2]){
+        dataToSend[2] = 6969;
+        MQ135.setA(605.18); MQ135.setB(-3.937); // Configure the equation to calculate CO concentration value
+        float CO = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+        dataToSend[2] = CO;
+      }else{
+        dataToSend[2] = 0;
+      }
+
+      // Alcohol
+      if(dataToCollect[3]){
+        dataToSend[3] = 6969;
+        MQ135.setA(77.255); MQ135.setB(-3.18); //Configure the equation to calculate Alcohol concentration value
+        float Alcohol = MQ135.readSensor(); // SSensor will read PPM concentration using the model, a and b values set previously or from the setup
+        dataToSend[3] = Alcohol;
+      }else{
+        dataToSend[3] = 0;
+      }
+
+      // CO2
+      if(dataToCollect[4]){
+        dataToSend[4] = 6969;
+        MQ135.setA(110.47); MQ135.setB(-2.862); // Configure the equation to calculate CO2 concentration value
+        float CO2 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+        dataToSend[4] = CO2;
+      }else{
+        dataToSend[4] = 0;
+      }
+
+      // Toluene
+      if(dataToCollect[5]){
+        dataToSend[5] = 6969;
+        MQ135.setA(44.947); MQ135.setB(-3.445); // Configure the equation to calculate Toluen concentration value
+        float Toluen = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+        dataToSend[5] = Toluen;
+      }else{
+        dataToSend[5] = 0;
+      }
+      // TESTING
+
+      // NH4
+      if(dataToCollect[6]){
+        dataToSend[6] = 6969;
+        MQ135.setA(102.2 ); MQ135.setB(-2.473); // Configure the equation to calculate NH4 concentration value
+        float NH4 = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+        dataToSend[6] = NH4;
+      }else{
+        dataToSend[6] = 0;
+      }
+
+      // Acetone
+      if(dataToCollect[7]){
+        dataToSend[7] = 6969;
+        MQ135.setA(34.668); MQ135.setB(-3.369); // Configure the equation to calculate Aceton concentration value
+        float Aceton = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+        dataToSend[7] = Aceton;
+      }else{
+        dataToSend[7] = 0;
+      }
+
+      // Get current Epoch Time
       char epochTimeString[20];
       getCurrentEpochTimeString(epochTimeString);
       
-      char message[50];
-      createDataString(message, deviceID, epochTimeString ,temperature, humidity);
-
+      // Create the message to publish via MQTT
+      char message[100];
+      createDataString(message, deviceID, epochTimeString, dataToSend);
       
-      char returnTopic[20] = "";
-
+      // Creat the return Topic
+      char returnTopic[30] = "";
       strcpy(returnTopic, labName);
       strcat(returnTopic, "/DATA");
 
+      // publish MQTT message
       sendMQTT(returnTopic, message);
-      //Serial.println(message);
+      Serial.println(message);
 
       for (int i = 0; i < periord; i++)
       {
-        if(!periordChanged){
-          vTaskDelay(1 / portTICK_PERIOD_MS);
-        }
+        if(!periordChanged){vTaskDelay(1 / portTICK_PERIOD_MS);}
         else{
-          Serial.println("The periord has changed");
           periordChanged = false;
           break;
         }
-        
       }      
     }else{
       vTaskDelay(500 / portTICK_PERIOD_MS); // Delay for 2000ms
@@ -545,61 +740,41 @@ void SampleSensor(void *pvParameters) {
 }
 
 
-void buttonTask(void *pvParameters) {
-  for (;;) {
-    if (xSemaphoreTake(xSemaphore, portMAX_DELAY)) {
-      Serial.println("Button pressed!");
-
-      // If you want to reset the device
-      if(RESET){
-        Serial.println("Reseting Device ID");
-        deviceID = 0;
-        vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for 1000ms
-      }
-
-      // If you want to read the ID
-      if(READ){
-        Serial.println("Reading Device ID");
-        Serial.print("The read device ID is: ");
-        Serial.println(deviceID);
-        vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for 1000ms
-      }
-
-      // Make sure you are in setup mode, and in send mode, and are not already in the process of sending a message
-      if((state == S1) && SEND && (deviceID == 0)){ // add inprocess back
-        // Create String
-        char result[45];
-        char returnWithLab[20];
-
-        char* topic = "/INIT/OUT";
-
-        strcpy(returnWithLab, labName);
-        strcat(returnWithLab, topic);
-
-        strcpy(result, formattedIP);
-        strcat(result, " ");
-        strcat(result, formattedMac);
-
-        Serial.println(returnWithLab);
-        Serial.println(result);
-        sendMQTT(returnWithLab, result);
-        inProcess = 1;
-        
-        vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for 1000ms
-      }
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS); // Delay for 2000ms
+void SetupTask() {
+  // If you want to reset the device
+  if(RESET){
+    Serial.println("Reseting Device ID");
+    deviceID = 0;
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for 1000ms
   }
-}
 
-void buttonISR() {
-  // Notify the task that the button was pressed
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+  // If you want to read the ID
+  if(READ){
+    Serial.println("Reading Device ID");
+    Serial.print("The read device ID is: ");
+    Serial.println(deviceID);
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for 1000ms
+  }
 
-  // If there was a task that was waiting for the semaphore,
-  // request a context switch to the waiting task
-  if (xHigherPriorityTaskWoken == pdTRUE) {
-    portYIELD_FROM_ISR();
+  // Make sure you are in setup mode, and in send mode, and are not already in the process of sending a message
+  if((state == S1) && SEND && (deviceID == 0)){ // add inprocess back
+    // Create String
+    char result[45];
+    char returnWithLab[20];
+
+    char* topic = "/INIT/OUT";
+
+    strcpy(returnWithLab, labName);
+    strcat(returnWithLab, topic);
+
+    strcpy(result, formattedIP);
+    strcat(result, " ");
+    strcat(result, formattedMac);
+
+    Serial.println(returnWithLab);
+    Serial.println(result);
+    sendMQTT(returnWithLab, result);
+    inProcess = 1;      
+    vTaskDelay(100 / portTICK_PERIOD_MS); // Delay for 2000ms
   }
 }

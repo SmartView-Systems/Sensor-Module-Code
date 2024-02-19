@@ -96,6 +96,7 @@ void loop() {
 
   MQ135.setA(34.668); MQ135.setB(-3.369); // Configure the equation to calculate Aceton concentration value
   float Aceton = MQ135.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  
   Serial.print("|   "); Serial.print(CO); 
   Serial.print("   |   "); Serial.print(Alcohol);
   // Note: 400 Offset for CO2 source: https://github.com/miguel5612/MQSensorsLib/issues/29

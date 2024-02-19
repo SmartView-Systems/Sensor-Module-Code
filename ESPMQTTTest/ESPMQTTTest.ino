@@ -3,8 +3,7 @@
 #include <WiFiClientSecure.h>
 
 // WiFi
-const char *ssid = "R Home2";
-const char *password = "B@hnBohn0905";
+const char *ssid = "BU Guest (unencrypted)";
 
 // MQTT Broker
 const int mqtt_port = 8883;
@@ -51,8 +50,12 @@ PubSubClient client(espClient);
 void setup() {
     // Set software serial baud to 115200;
     Serial.begin(115200);
+    delay(1000);
+
+    WiFi.mode(WIFI_STA); //Optional
+
     // connecting to a WiFi network
-    WiFi.begin(ssid, password);
+    WiFi.begin(ssid);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.println("Connecting to WiFi..");
